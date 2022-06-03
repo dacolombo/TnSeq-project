@@ -43,6 +43,19 @@ window_separated_gr <- GRangesList(window_separated_gr)
 fitness_gr <- unique(unlist(window_separated_gr))
 
 
+# Add gene categories based on each gene fitness
+fitness_breakpoints <- c(0,0.96,1.04,Inf)
+fitness_categories <- c('Disadvantageous','Neutral','Advantageous')
+fitness_gr$gene_category <- cut(fitness_gr$avg_fitness, breakpoints=fitness_breakpoints, labels=fitness_categories)
+
+
+# Compute middle coordinate of each gene in radians
+# Check this formula
+radian <- max(end(fitness_gr))/pi
+
+
+
+
 # Old stuff
 smoothScatter(x=(geneCoord$V2[fData$average_fitness!=0]+geneCoord$V3[fData$average_fitness!=0])/2,
               y=fData$average_fitness[fData$average_fitness!=0],
