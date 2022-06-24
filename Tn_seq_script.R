@@ -14,9 +14,12 @@ library("ggplot2")
 # 
 setwd('/home/daniele/github/TnSeq-project')
 
-fitness_data <- na.omit(read.table("data/Tn_seq_fitness_data_Opijnen_et_al_2009.txt", header=TRUE, stringsAsFactors = FALSE, sep ="\t"))
+fitness_data <- na.omit(read.table("data/Tn_seq_fitness_data_Opijnen_et_al_2009.txt",
+                                   header=TRUE, stringsAsFactors = FALSE, sep ="\t"))
 
-gene_coordinates <- read.table("data/GCF_000006885.1_ASM688v1_genomic_olt.txt", header=FALSE, stringsAsFactors=FALSE, sep = "\t", col.names=c('locus','start','end'))
+gene_coordinates <- read.table("data/GCF_000006885.1_ASM688v1_genomic_olt.txt",
+                               header=FALSE, stringsAsFactors=FALSE, sep = "\t",
+                               col.names=c('locus','start','end'))
 
 # Merge data
 merged_fitness <- merge(fitness_data, gene_coordinates, by='locus')
@@ -27,28 +30,6 @@ fitness_gr <- GRanges(
     ranges = IRanges(start=merged_fitness$start, end=merged_fitness$end, names=merged_fitness$locus),
     avg_fitness = merged_fitness$average_fitness)
 
-# Build window of 100000 nucleotides
-window_size <- 100000
-windows_start <- seq(from=0, to=max(end(fitness_gr)), by=window_size)
-window_gr <- GRanges(seqnames = Rle("chr", length(windows_start)),
-                     ranges = IRanges(start=windows_start, width=window_size))
-
-# Compute average fitness in each window of 100000 nucleotides
-window_separated_gr <- lapply(seq(1:length(window_gr)), function(X){
-                                  window_ranges <- subsetByOverlaps(fitness_gr, window_gr[X])
-                                  window_ranges$window_avg_fitness <- mean(window_ranges$avg_fitness)
-                                  return(window_ranges)
-                     }
-)
-
-window_separated_gr <- GRangesList(window_separated_gr)
-
-
-
-# Update fitness_gr with new window_avg_fitness metadata column,
-# taking unique ranges since one range could overlap two windows
-fitness_gr <- unique(unlist(window_separated_gr))
-
 
 # Add gene categories based on each gene fitness
 fitness_breakpoints <- c(0,0.96,1.04,Inf)
@@ -56,55 +37,82 @@ fitness_categories <- c('Disadvantageous','Neutral','Advantageous')
 fitness_gr$gene_category <- cut(fitness_gr$avg_fitness, breaks=fitness_breakpoints, labels=fitness_categories)
 
 
-############## Data circularization ################
-
-# Compute middle coordinate of each gene in radians
-# Proportion:
-# given l = length of the circular genome
-#       p = position to convert in radians
-# The following proportion must be solved for x:
-# l : 2*pi = p : x
-# Obtaining the following formula:
-# x = p * 2*pi/l
+# Compute circular coordinates
 genome_length <- max(end(fitness_gr))
-middle_coordinates <- (end(fitness_gr)-start(fitness_gr))/2 + start(fitness_gr)
-fitness_gr$radians_coordinate <- middle_coordinates*2*pi/genome_length
-fitness_gr$degrees_coordinate <- middle_coordinates*360/genome_length
+fitness_gr$middle_coordinate <- (end(fitness_gr)-start(fitness_gr))/2 + start(fitness_gr)
+fitness_gr$radians_coordinate <- fitness_gr$middle_coordinate*2*pi/genome_length
+fitness_gr$degrees_coordinate <- fitness_gr$middle_coordinate*360/genome_length
 
 
 
-# Extract X (middle position of window) and Y (avg fitness) values for linear regression model
-windows_start <- min(start(window_separated_gr))
-windows_end <- max(end(window_separated_gr))
-window_middle_position <- round(((windows_end - windows_start)/2) + windows_start)
-window_middle_position_radians <- window_middle_position*2*pi/genome_length
-window_middle_position_degrees <- window_middle_position*360/genome_length
+compute_window_statistics <- function(gr, window_size=100000) {
+  # Define vector containing window start coordinates
+  windows_start <- seq(from=0, to=max(end(gr)), by=window_size)
+  
+  # Build GRanges object containing the windows
+  window_gr <- GRanges(seqnames=Rle("chr", length(windows_start)),
+                       ranges=IRanges(start=windows_start, width=window_size))
+  
+  # Retrieve genome length (used to convert coordinates in radians)
+  genome_length <- max(end(gr))
+  
+  # Build GRangesList object: at each loop of the lapply we consider one window
+  # and we compute the statistics for the group of genes overlapping with the
+  # window.
+  # The result would be a list with each element being a GRanges object
+  # containing the genes overlapping with a specific window.
+  
+  window_statistics <- lapply(seq(1:length(window_gr)), function(X){
+    # Select window
+    window <- window_gr[X]
+    
+    # Subset by selected window
+    window_overlapping_gr <- subsetByOverlaps(fitness_gr, window)
+    
+    # Compute window-related statistics
+    window_middle_coord <- round((end(window)-start(window))/2 + start(window))
+    window_middle_coord_radians <- window_middle_coord*2*pi/genome_length
+    window_avg_fitness <- mean(window_overlapping_gr$avg_fitness)
+    window_statistics <- data.frame(coordinate=window_middle_coord,
+                                    radians=window_middle_coord_radians,
+                                     fitness=window_avg_fitness)
+     
+    return(window_statistics)
+    }
+  )
+  
+  # Return dataframe
+  return(do.call(rbind.data.frame, window_statistics))
+}
 
-df_linear_regression <- data.frame(radians=window_middle_position_radians,
-                                   degrees=window_middle_position_degrees,
-                                   fitness=unique(fitness_gr$window_avg_fitness))
+window_statistics <- compute_window_statistics(fitness_gr)
+window_statistics
+
+
+
 
 
 ############## Linear Model ################
 # Fit linear model using radians
-linear_model <- lm(formula=fitness ~ sin(radians)+cos(radians), data=df_linear_regression)
+linear_model <- lm(formula=fitness ~ sin(radians)+cos(radians), data=window_statistics)
 summary(linear_model)
 
 # Predict window avg fitness
-predicted_fitness <- predict(linear_model, df_linear_regression)
-plot(window_middle_position, predicted_fitness)
-plot(window_middle_position, df_linear_regression$fitness)
+predicted_fitness <- predict(linear_model, window_statistics)
+plot(window_statistics$coordinate, predicted_fitness)
+plot(window_statistics$coordinate, window_statistics$fitness)
 
 # Correct fitness by removing smile effect
-corrected_fitness <- df_linear_regression$fitness - predicted_fitness + 1
-plot(window_middle_position, corrected_fitness)
+corrected_fitness <- window_statistics$fitness - predicted_fitness + 1
+plot(window_statistics$coordinate, corrected_fitness)
 
 
 # Use the linear model on all the data
-df_linear_regression_all <- data.frame(radians=fitness_gr$radians_coordinate,
-                                       fitness=fitness_gr$avg_fitness)
-corrected_fitness_all <- fitness_gr$avg_fitness - predict(linear_model, df_linear_regression_all) + 1
-plot(middle_coordinates, corrected_fitness_all)
+all_df <- data.frame(coordinate=fitness_gr$middle_coordinate,
+                     radians=fitness_gr$radians_coordinate,
+                     fitness=fitness_gr$avg_fitness)
+corrected_fitness_all <- all_df$fitness - predict(linear_model, all_df) + 1
+plot(all_df$coordinate, corrected_fitness_all)
 
 
 
