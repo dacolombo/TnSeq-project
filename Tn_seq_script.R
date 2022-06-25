@@ -45,6 +45,21 @@ fitness_gr$degrees_coordinate <- fitness_gr$middle_coordinate*360/genome_length
 
 
 
+############## Compute windows ################
+
+compute_middle_coord <- function(gr, gnome_length) {
+  start <- min(start(gr))
+  end <- max(end(gr))
+  middle_coord <- round((end-start)/2 + start)
+  middle_coord_radians <- middle_coord*2*pi/genome_length
+  return(c(middle_coord, middle_coord_radians))
+}
+
+compute_avg_fitness <- function(gr) {
+  avg_fitness <- mean(gr$avg_fitness)
+  return(avg_fitness)
+}
+
 compute_window_statistics <- function(gr, window_size=100000) {
   # Define vector containing window start coordinates
   windows_start <- seq(from=0, to=max(end(gr)), by=window_size)
@@ -62,7 +77,7 @@ compute_window_statistics <- function(gr, window_size=100000) {
   # The result would be a list with each element being a GRanges object
   # containing the genes overlapping with a specific window.
   
-  window_statistics <- lapply(seq(1:length(window_gr)), function(X){
+  window_statistics <- lapply(X=seq(1:length(window_gr)), FUN=function(X){
     # Select window
     window <- window_gr[X]
     
@@ -70,25 +85,48 @@ compute_window_statistics <- function(gr, window_size=100000) {
     window_overlapping_gr <- subsetByOverlaps(fitness_gr, window)
     
     # Compute window-related statistics
-    window_middle_coord <- round((end(window)-start(window))/2 + start(window))
-    window_middle_coord_radians <- window_middle_coord*2*pi/genome_length
-    window_avg_fitness <- mean(window_overlapping_gr$avg_fitness)
-    window_statistics <- data.frame(coordinate=window_middle_coord,
-                                    radians=window_middle_coord_radians,
-                                     fitness=window_avg_fitness)
-     
-    return(window_statistics)
+    window_coordinates <- compute_middle_coord(window, genome_length)
+    window_avg_fitness <- compute_avg_fitness(window_overlapping_gr)
+    return(c(window_coordinates, window_avg_fitness))
     }
   )
   
   # Return dataframe
-  return(do.call(rbind.data.frame, window_statistics))
+  df <- as.data.frame(do.call(rbind, window_statistics))
+  colnames(df) <- c('coordinate','radians','fitness')
+  return(df)
 }
 
 window_statistics <- compute_window_statistics(fitness_gr)
 window_statistics
 
+############## Compute groups ################
 
+compute_group_statistics <- function(gr, group_size=100) {
+  # Divide GRanges object into groups of 200 genes
+  number_of_genes <- length(gr)
+  number_of_groups <- ceiling(number_of_genes/group_size)
+  gr_groups <- split(gr, rep(1:number_of_groups, each=group_size, length.out=number_of_genes))
+
+  # Retrieve genome length (used to convert coordinates in radians)
+  genome_length <- max(end(gr))
+
+  # Compute statistics for each group of genes
+  group_statistics <- lapply(seq(1:number_of_groups), function(X){
+    group <- unlist(gr_groups[X])
+    group_coordinates <- compute_middle_coord(group, genome_length)
+    group_avg_fitness <- compute_avg_fitness(group)
+    return(c(group_coordinates, group_avg_fitness))
+  })
+
+  # Return dataframe
+  df <- as.data.frame(do.call(rbind, group_statistics))
+  colnames(df) <- c('coordinate','radians','fitness')
+  return(df)
+}
+
+group_statistics <- compute_group_statistics(fitness_gr)
+group_statistics
 
 
 
