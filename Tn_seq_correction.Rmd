@@ -1,0 +1,701 @@
+---
+title: "Tn-Seq correction of fitness in a circular genome"
+date: "`r Sys.Date()`"
+author: "Daniele Colombo"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    df_print: paged
+---
+
+
+
+```{r config, include=FALSE}
+library("knitr")
+library("rmdformats")
+## Global options
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(root.dir='/home/daniele/github/TnSeq-project',
+              width=75)
+options(max.print=10000, width=1000)
+```
+
+```{css scroll, echo=FALSE, include=FALSE}
+/* this makes large outputs have a horizontal scroll bar
+   see https://stackoverflow.com/a/58964492 */
+pre, code {white-space:pre !important; overflow-x:scroll !important}
+```
+
+# Introduction
+Tn-seq is a method that can be used to evaluate the fitness of a gene (i.e. how
+fundamental is a gene for cell survival and reproduction) by transposon insertion.
+The cells studied are used to build a library under a test condition and the
+transposons junctions inserted in the genomes are sequenced. The change in
+frequency of each insertion and the population size in the test condition are
+used to compute the fitness, which is a quantitative measure of growth rate.
+
+In this vignette, the data coming from Tn-seq applied to S.pneumoniae is used
+(Source: van Opijnen et al, 2009. https://doi-org.pros1.lib.unimi.it/10.1038/nmeth.1377)
+The aim of this project is to correct the bias of fitness data, which is 
+introduced by DNA replication, that causes a higher amount of DNA
+present in the cell for the sequences nearest to the replication fork.
+This change in DNA amounts causes a higher measured fitness for genes in their
+proximity. These regions are at the two extremities of the linearized
+chromosome, which are actually contiguous as the bacterial genome is circular.
+This effect causes a 'smile shape' in the distribution of the fitness over the
+genome position, which leads to the wrong classification of many genes,
+especially the ones in the chromosome extremities and its middle region.
+
+```{r wd, echo=FALSE}
+setwd('/home/daniele/github/TnSeq-project')
+```
+
+## Dependencies
+The main packages used for this analysis are from the following packages:
+```{r dependencies}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("GenomicRanges")
+
+library("GenomicRanges")
+library("cowplot")
+library("ggplot2")
+library("dplyr")
+library("scales")
+library('ggsankey')
+```
+
+# Data loading and preprocessing
+The data is imported through a tsv file:
+
+```{r data_import}
+fitness_data <- na.omit(read.table("data/Tn_seq_fitness_data_Opijnen_et_al_2009.txt",
+                                   header=TRUE, stringsAsFactors = FALSE, sep ="\t"))
+
+gene_coordinates <- read.table("data/GCF_000006885.1_ASM688v1_genomic_olt.txt",
+                               header=FALSE, stringsAsFactors=FALSE, sep = "\t",
+                               col.names=c('locus','start','end'))
+```
+
+The fitness_data and gene_coordinates dataframes are then merged in a single
+dataframe using the gene id and converted in a GRanges object (defined in the
+GenomicRanges package from Bioconductor) which allows for an easier management
+of genomic ranges:
+
+```{r grange}
+# Merge data
+merged_fitness <- merge(fitness_data, gene_coordinates, by='locus')
+
+# Convert data into genomic ranges
+fitness_gr <- GRanges(seqnames = Rle("chr", nrow(merged_fitness)),
+                      ranges = IRanges(start=merged_fitness$start,
+                                       end=merged_fitness$end,
+                                       names=merged_fitness$locus),
+                      avg_fitness = merged_fitness$average_fitness)
+```
+
+The GRange object allows to have metadata columns containing information about
+each gene. As they are needed in the next steps, some variables are added as
+metadata:
+
+* **gene_category**: the fitness category of each gene mutation. Fitness values are usually
+  around 1. In particular, a fitness lower than 1 indicates that a gene depletion
+  is disadvantageous, while a fitness higher than 1 indicates that a gene depletion
+  is advantageous. If a gene has a fitness equal to 1, it means that it doesn't
+  have a crucial role in the cell survival and/or reproduction.
+  Some ranges are used to define the gene category based on fitness:
+   - 0 < fitness < 0.96: disadvantageous;
+   - 0.96 < fitness < 1.04: neutral;
+   - fitness > 1.04: advantageous.
+* **middle_coordinate**: the middle coordinate of each gene;
+* **radians_coordinate**: the middle coordinate of each gene expressed in radians.
+
+Since the genome is circular, it is useful to consider the coordinates in radians,
+in that way the last position of the genome will be next to its first
+position. This will allow easier computations and an easier data visualization.
+
+```{r metadata}
+# Add gene categories based on each gene fitness
+fitness_breakpoints <- c(0,0.96,1.04,Inf)
+fitness_categories <- c('Disadvantageous','Neutral','Advantageous')
+fitness_gr$gene_category <- cut(fitness_gr$avg_fitness,
+                                breaks=fitness_breakpoints,
+                                labels=fitness_categories)
+
+# Add middle coordinates
+fitness_gr$middle_coordinate <- (end(fitness_gr)+start(fitness_gr))/2
+
+# Add middle coordinates in radians
+genome_length <- max(end(fitness_gr))
+fitness_gr$radians_coordinate <- fitness_gr$middle_coordinate*2*pi/genome_length
+
+# Show fitness_gr
+head(fitness_gr)
+```
+
+
+It's now possible to see the dependency between gene fitness and coordinate as
+explained before:
+
+```{r first_scatterplot}
+df_plot <- data.frame(coordinate=fitness_gr$middle_coordinate,
+                      fitness=fitness_gr$avg_fitness,
+                      category=fitness_gr$gene_category)
+
+ggplot(df_plot, aes(x=coordinate, y=fitness)) + 
+    geom_point(aes(color=category)) +
+    geom_smooth(color='black') +
+    ylim(0.5, 1.5)
+```
+
+As it's clearly visible, genes at the extremities tend to have a higher fitness,
+while genes in the middle tend to have a lower fitness. Due to this, there are
+many genes in the extremities classified as advantageous and many genes in the
+middle classified as disadvantageous.
+
+To reduce the dependency of fitness over the coordinate while keeping each gene
+fitness variability, a linear model is fitted with the following variables:
+
+* **Window averaged fitness**: this will be the dependent variable, it's averaged
+  on the genes inside a window of the genome to avoid taking into account each gene
+  variability.
+* **Coordinate**: this will be the dependent variable. In one model the linear coordinate
+  will be used, while in the second one the radians coordinate will be used.
+
+
+## Window statistics
+Since in this model and in the following the genome is going to be divided into
+windows and for each one the middle coordinate and average fitness is computed, a
+function is defined and then reused:
+
+```{r window_functions}
+# Compute the middle coordinate of all genomic regions in a GRanges object
+compute_middle_coord <- function(gr, gnome_length) {
+  start <- min(start(gr))
+  end <- max(end(gr))
+  middle_coord <- round((end+start)/2)
+  middle_coord_radians <- middle_coord*2*pi/genome_length
+  return(c(middle_coord, middle_coord_radians))
+}
+
+# Compute the average of fitness of all genomic regions in a GRanges object
+compute_avg_fitness <- function(gr) {
+  avg_fitness <- mean(gr$avg_fitness)
+  return(avg_fitness)
+}
+
+# This function takes as input the initial GRanges object and the window size
+# It performs the following steps:
+# 1. Define a GRanges object containing the windows in which the genome is divided
+# 2. For each window, take the genes overlapping to that window and compute the
+#    middle coordinate and the average of the fitness
+# 3. Return a dataframe containing linear and radians coordinate and fitness
+#    of each window
+compute_window_statistics <- function(gr, window_size=100000) {
+  # Define vector containing window start coordinates
+  windows_start <- seq(from=min(start(gr)), to=max(end(gr)), by=window_size)
+  
+  # Build GRanges object containing the windows
+  window_gr <- GRanges(seqnames=Rle("chr", length(windows_start)),
+                       ranges=IRanges(start=windows_start, width=window_size))
+  
+  # Retrieve genome length (used to convert coordinates in radians)
+  genome_length <- max(end(gr))
+  
+  # Build GRangesList object: at each loop of the lapply we consider one window
+  # and we compute the statistics for the group of genes overlapping with the
+  # window, returning a list containing them.
+  
+  window_statistics <- lapply(X=seq(1:length(window_gr)), FUN=function(X){
+    # Select window
+    window <- window_gr[X]
+    
+    # Subset by selected window
+    window_overlapping_gr <- subsetByOverlaps(gr, window)
+    
+    # Compute window-related statistics
+    window_coordinates <- compute_middle_coord(window, genome_length)
+    window_avg_fitness <- compute_avg_fitness(window_overlapping_gr)
+    return(c(window_coordinates, window_avg_fitness))
+    }
+  )
+  
+  # Convert the list of lapply into a dataframe
+  df <- as.data.frame(do.call(rbind, window_statistics))
+  colnames(df) <- c('coordinate','radians','fitness')
+  return(df)
+}
+```
+
+With this function the variables needed for the linear model are computed, using
+the default window size of 100000 nucleotides:
+
+```{r window_stats}
+window_statistics <- compute_window_statistics(fitness_gr)
+window_statistics
+```
+
+
+# Linear Regression: linear coordinates
+Since linear coordinates that are referred to a circular genome which is replicated
+in both directions are used, the linear model is trained on the first half of
+the genome and a modification of the first model is used for the second half.
+
+```{r lm_linear_coord}
+# Take genes overlapping with the first half of the genome and compute window statistics
+first_half_gr <- subsetByOverlaps(fitness_gr, GRanges('chr', IRanges(0, genome_length/2)))
+first_half_df_windows <- compute_window_statistics(first_half_gr, window_size=100000)
+
+# Take genes overlapping with the second half of the genome and compute window statistics
+second_half_gr <- subsetByOverlaps(fitness_gr, GRanges('chr', IRanges(genome_length/2, genome_length)))
+second_half_df_windows <- compute_window_statistics(second_half_gr, window_size=100000)
+
+# Fit model on the first half
+lm_linear_coord <- lm(formula=fitness ~ coordinate, data=first_half_df_windows)
+summary(lm_linear_coord)
+```
+
+The R² and adjusted R² of this model is quite high and both the intercept and the
+coefficient for the coordinate variable are significant.
+
+The fitness predicted by this model is now computed for the windows of the first
+half:
+```{r first_half_pred}
+# Predict first half (train)
+first_half_pred_windows <- predict(lm_linear_coord, first_half_df_windows)
+mean((first_half_pred_windows - first_half_df_windows$fitness)^2)
+```
+
+The MSE for the first half is quite low, indicating a good fit on the training
+data.
+
+In order to predict the values for the second half, which have a distribution
+specular to the first half with respect to the middle of the genome, the first
+model is modified appropriately:
+```{r second_half_pred}
+# Predict second half (test)
+## Get model coefficients
+a <- coef(lm_linear_coord)['(Intercept)']
+b <- coef(lm_linear_coord)['coordinate']
+
+## The new model will be fitness ~ a - b*(coordinate - genome_length)
+second_half_pred_windows <- a - b*(second_half_df_windows$coordinate - genome_length)
+mean((second_half_pred_windows - second_half_df_windows$fitness)^2)
+```
+
+The MSE for the second half is quite similar to the one of the first, indicating
+that the model fits similarly on both and is suitable to model both the train
+and test data.
+
+This model can now be used to correct the fitness values. In order to remove the
+dependency of fitness over the coordinate, the difference between the observed
+and the predicted fitness is computed.
+
+Since in this way the data would be distributed around 0, and it is assumed that
+the fitness should be distributed around 1, the data is shifted by summing 1 to the
+difference obtained before.
+
+```{r corrected_window_fitness_linear}
+# Correct fitness values based on linear model
+first_half_df_windows$corrected_fitness <- first_half_df_windows$fitness - first_half_pred_windows + 1
+second_half_df_windows$corrected_fitness <- second_half_df_windows$fitness - second_half_pred_windows + 1
+
+# Concatenate the two halves
+window_statistics_linear <- rbind(first_half_df_windows, second_half_df_windows)
+```
+
+In order to visualize the effect of this correction, a function to plot the data
+before and after correction is defined and used:
+
+```{r correction_plots_windows}
+correction_plots_windows <- function(df, x) {
+  
+  plot1 <- ggplot(df, aes(x=.data[[x]], y=fitness)) +
+    geom_point() +
+    geom_smooth() +
+    ylim(0.9, 1.1) +
+    theme(plot.margin=unit(c(3,0,0,1), "lines"))
+  
+  plot2 <- ggplot(df, aes(x=.data[[x]], y=corrected_fitness)) +
+    geom_point() +
+    geom_smooth() +
+    ylim(0.9, 1.1) +
+    theme(plot.margin=unit(c(3,0,0,1), "lines"))
+  
+  plot_grid(plot1, plot2, ncol=2, label_x=0,
+            labels=c('Before correction', 'After correction'))
+}
+
+correction_plots_windows(window_statistics_linear, x='coordinate')
+```
+
+The correction seems to perform well on the windows, since in the second plot the
+line is quite straight around 1.
+Having visual proof that this model works for fitness correction, it can now be
+used on the data of all the genes in the same way:
+
+```{r corrected_fitness_linear}
+# Predict fitness for genes in the first half
+first_half_df_all <- data.frame(coordinate=first_half_gr$middle_coordinate,
+                                fitness=first_half_gr$avg_fitness)
+
+first_half_pred_all <- predict(lm_linear_coord, first_half_df_all)
+first_half_df_all$corrected_fitness <- first_half_df_all$fitness - first_half_pred_all + 1
+
+
+# Predict fitness for genes in the second half
+second_half_df_all <- data.frame(coordinate=second_half_gr$middle_coordinate,
+                                 fitness=second_half_gr$avg_fitness)
+
+second_half_pred_all <- a - b*(second_half_df_all$coordinate - genome_length)
+second_half_df_all$corrected_fitness <- second_half_df_all$fitness - second_half_pred_all + 1
+
+# Concatenate the two halves
+all_df_linear <- rbind(first_half_df_all, second_half_df_all)
+
+# Remove possible duplicates (genes possibly overlapping both halves of the genome)
+all_df_linear <- all_df_linear[!duplicated(all_df_linear$coordinate),]
+```
+
+With the new fitness, a corrected catogery can be assigned to each gene, which may
+be different from the one assigned with the previous fitness:
+
+```{r new_gene_category_linear}
+# Add previous category to dataframe
+all_df_linear$category_before <- fitness_gr$gene_category
+
+# Add new category
+all_df_linear$category_after <- cut(all_df_linear$corrected_fitness,
+                                    breaks=fitness_breakpoints,
+                                    labels=fitness_categories)
+```
+
+To better visualize the effect of fitness correction on each gene, a function similar
+to the one used before, which also shows the gene cateogry, is used:
+
+```{r correction_plots_linear, fig.width=12, fig.height=10}
+correction_plots <- function(df, x) {
+  # First scatterplot, before correction
+  plot1 <- ggplot(df, aes(x=.data[[x]], y=fitness)) + 
+    geom_point(aes(color=category_before)) +
+    geom_smooth(color='black') +
+    ylim(0.8, 1.2) +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  # Second scatterplot, after correction
+  plot2 <- ggplot(df, aes(x=.data[[x]], y=corrected_fitness)) + 
+    geom_point(aes(color=category_after)) +
+    geom_smooth(color='black') +
+    ylim(0.8, 1.2) +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  # First barplot, before correction
+  plot3 <- ggplot(df, aes(x=factor(1), fill=category_before)) +
+    geom_bar(stat="count") +
+    coord_polar("y") +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  # Second barplot, after correction
+  plot4 <- ggplot(df, aes(x=factor(1), fill=category_after)) +
+    geom_bar(stat="count") +
+    coord_polar("y") +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  # Show plots
+  plot_grid(plot1, plot2, plot3, plot4, ncol=2, nrow=2,
+            labels=c('Before correction', 'After correction'), label_x=0)
+}
+
+correction_plots(all_df_linear,x='coordinate')
+```
+
+After fitness correction, the data is distributed around 1 and the 'smile effect'
+disappear, even though there seems to be a flex near the end of the genome.
+As for the gene category, a lower number of disadvantageous and advantageous genes
+is observed after correction, with a higher number of neutral genes. These
+are most probably mainly genes misclassified due to their position being in the 
+extremities and in the middle of the genome.
+
+
+# Linear Regression: radians coordinates
+Even though the first model performed well, it may be useful to consider the
+coordinates of each gene in a polar coordinate system. In that way, the fact that
+the genome is circular is taken into account directly in the data and it won't
+be necessary to split the data in two.
+
+Also in this case, the model is fitted on window-averged data, using windows of
+100000 nucleotides. Since the dataframe containing the radians coordinates and the
+fitness of each window as already been built, it will be used as a starting point.
+
+When dealing with circular variables and a periodic structure of the data,
+the sine and cosine functions are usually exploited (mainly in pairs) to better
+model the fact that the beginning of the scale is the same as the end, i.e.
+position 0 of the linear genome is equal to the position at the end of the genome
+(source: Stata Journal, https://www.stata-journal.com/sjpdf.html?articlenum=st0116).
+
+```{r lm_radians_coord}
+# Use dataframe to build model with radians
+window_statistics_radians <- window_statistics
+
+# Fit model
+lm_radians <- lm(formula=fitness ~ sin(radians) + cos(radians), data=window_statistics_radians)
+summary(lm_radians)
+```
+
+The R² and the adjusted R² of this model is better than the first one. Even though
+the coefficient of the sine term is not significant, the R² of this model is
+slightly better than the one without it (not shown here).
+
+The fitness of each window can be now corrected with this model to see if the 
+correction works as expected in the same way as before:
+
+```{r corrected_window_fitness_radians}
+# Predict window fitness with the radians model
+predicted_fitness <- predict(lm_radians, window_statistics_radians)
+
+# Correct window fitness
+window_statistics_radians$corrected_fitness <- window_statistics_radians$fitness - predicted_fitness + 1
+
+# Plot window fitness correction
+correction_plots_windows(window_statistics_radians, x='radians')
+```
+
+The model seems to perform similarly with respect to the first one, and it can now
+be used to correct the fitness values of each gene:
+
+```{r correction_plots_radians, fig.width=12, fig.height=10}
+# Build dataframe to use with the linear model
+all_df_radians <- data.frame(radians=fitness_gr$radians_coordinate,
+                             fitness=fitness_gr$avg_fitness,
+                             category_before=factor(fitness_gr$gene_category))
+
+# Compute corrected fitness values
+all_df_radians$corrected_fitness <- all_df_radians$fitness - predict(lm_radians, all_df_radians) + 1
+
+# Add new gene category based on corrected fitness
+all_df_radians$category_after <- cut(all_df_radians$corrected_fitness,
+                                     breaks=fitness_breakpoints,
+                                     labels=fitness_categories)
+
+# Plot fitness correction
+correction_plots(all_df_radians,x='radians')
+```
+
+Considering the results on all the genes, this model seems to perform better at
+fitness correction, since it transform the data into an almost completely straight
+distribution around 1 also in the genome extremities.
+
+For this reason, this model will be used from now on.
+
+A similar rate of change of category after fitness correction is observed with
+respect to the previous model.
+
+
+# Gene category change
+
+## Visualization of circular coordinates
+To better visualize the difference in fitness interpretation with and without
+the correction based on position, a circular plot may be useful. In this way,
+a further confirmation can be obtained that the bias introduced in sites proximal
+to the origin of replication is present and is removed by the correction.
+
+For this purpose smaller windows of the genome are used, so that the change in
+gene category can be observed in more detail. A window of 5000 nucleotides is used:
+
+```{r circular_barplot, fig.width=7, fig.height=12}
+# Build dataframe with windows of 5000 nt for circular plot
+window_plot_df <- compute_window_statistics(fitness_gr, 5000)
+window_plot_df$category_before <- cut(window_plot_df$fitness,
+                                      breaks=fitness_breakpoints,
+                                      labels=fitness_categories)
+
+# Correct fitness with radians model
+window_plot_df$corrected_fitness <- window_plot_df$fitness - predict(lm_radians, window_plot_df) + 1
+window_plot_df$category_after <- cut(window_plot_df$corrected_fitness,
+                                     breaks=fitness_breakpoints,
+                                     labels=fitness_categories)
+
+
+# Build scale with pi for plot axis
+pi_scales <- math_format(.x*pi, format = function(x) x / pi)
+
+# Plot before correction
+plot1 <- ggplot(window_plot_df) + 
+  geom_bar(aes(x=radians, y=fitness, fill=category_before), stat="identity") + 
+  ylim(-0.5,1.3) +
+  theme(axis.title = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +
+  coord_polar(start=0) +
+  scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2)) +
+  theme(plot.margin = unit(c(3,0,0,1), "lines"))
+
+
+# Plot after correction
+plot2 <- ggplot(window_plot_df) + 
+  geom_bar(aes(x=radians, y=corrected_fitness, fill=category_after), stat="identity") + 
+  ylim(-0.5,1.3) +
+  theme(axis.title = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +
+  coord_polar(start=0) +
+  scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2)) +
+  theme(plot.margin = unit(c(3,0,0,1), "lines"))
+
+# Show plots together
+plot_grid(plot1, plot2, nrow=2, label_x=0,
+          labels=c('Before correction', 'After correction'))
+```
+
+From the first circular plot it can be seen that before correction, many genes
+near the origin of replication (upper portion, around 2π) have a fitness significantly
+higher than 1, causing more windows to be classified as advantageous.
+The opposite is true for the genes furthest from the origin of replication (lower
+portion, around π), which cause more windows to be classified as disadvantageous.
+
+By applying fitness correction, the distribution of advantageous and disadvantageous
+genes mutations seems to be spread more evenly around the genome.
+
+## Visualization of category change
+To better visualize the shift of category before and after fitness correction,
+a Sankey plot may be useful. To plot it, the dataframe used to fit the linear
+model with radians needs to be transformed:
+
+```{r sankey, fig.width=12, fig.height=8}
+df_sankey_plot <- all_df_radians %>% ggsankey::make_long(category_before, category_after)
+
+ggplot(df_sankey_plot, aes(x=x, next_x=next_x,
+                           node=factor(node, levels=fitness_categories),
+                           next_node=factor(next_node, levels=fitness_categories),
+                           fill=factor(node, levels=fitness_categories))) +
+  geom_sankey() +
+  guides(fill=guide_legend(title="gene category")) +
+  theme_sankey(base_size=16)
+```
+
+As can be seen from the Sankey plot, most of the category change is due to genes
+originally misclassified as advantageous, which are in reality neutral.
+
+
+## Gene Ontology Terms
+It may be interesting to see which are the genes misclassified as neutral, that
+actually have a positive or negative effect on fitness when disrupted.
+Starting from this gene set, it may be possible to perform Gene Set Enrichment
+Analysis (GSEA) in order to test a possible enrichment of a biological function
+which is common to them that may confirm their influence on fitness.
+
+In this project, qualitative analysis on the biological function of the genes
+initially misclassified as neutral is performed.
+By taking the symbols of these genes, the UniProt API is used to retrieve the
+Gene Ontology Terms associated with them in order to get an overview of their function.
+
+First, two gene lists are saved in two files:
+
+* Genes initially misclassified as neutral that actually have an advantageous insertion.
+* Genes initially misclassified as neutral that acctualy have a disadvantageous insertion.
+
+```{r gene_lists}
+# Add gene symbol
+all_df_radians$symbol <- names(fitness_gr)
+
+# Get gene lists
+neutral_to_advantageous <- all_df_radians[all_df_radians$category_before=='Neutral' &
+                                          all_df_radians$category_after=='Advantageous',]$symbol
+
+neutral_to_disadvantageous <- all_df_radians[all_df_radians$category_before=='Neutral' &                                                                         all_df_radians$category_after=='Disadvantageous',]$symbol
+
+# Save gene lists to files
+write.table(neutral_to_advantageous, './neutral_to_advantageous.csv',
+            row.names=FALSE, col.names=FALSE, quote=FALSE)
+write.table(neutral_to_disadvantageous, './neutral_to_disadvantageous.csv',
+            row.names=FALSE, col.names=FALSE, quote=FALSE)
+```
+
+The following code is written in bash because of the better management of the API
+output with the CLI tool jq. With the two while loops, the genes in the two gene
+sets are searched with the UniProt API and the GoTerms associated with them are
+retrieved. With the query field in the API url the taxonomy ID for S. pneumoniae
+TIGR4 (170187) is passed together with the gene name:
+
+```{bash api}
+# Retrieve GoTerms for neutral to advantageous genes
+while IFS= read -r gene;
+do
+  curl -s https://rest.uniprot.org/uniprotkb/search?query=%28taxonomy_id%3A170187%29%20${gene} | jq '.results[].uniProtKBCrossReferences[] | select(.database=="GO") | .properties[] |   select(.key=="GoTerm") | .value';
+done < ./neutral_to_advantageous.csv > ./neutral_to_advantageous_goterms.txt;
+  
+# Retrieve GoTerms for neutral to advantageous genes
+while IFS= read -r gene;
+do
+  curl -s https://rest.uniprot.org/uniprotkb/search?query=%28taxonomy_id%3A170187%29%20${gene} | jq '.results[].uniProtKBCrossReferences[] | select(.database=="GO") | .properties[] | select(.key=="GoTerm") | .value';
+done < ./neutral_to_disadvantageous.csv > ./neutral_to_disadvantageous_goterms.txt;
+```
+
+By having a look at the two files generated (neutral_to_advantageous_goterms.txt
+and neutral_todisadvantageous_goterms.txt) it's possible to evaluate if it is
+reasonable that these genes actually have an impact on the cell fitness.
+
+Genes whose mutation has been misclassified as neutral and is instead advantageous
+show some GO terms that may explain their effect on cell fitness. Some terms 
+indicate that this gene set is composed of some genes that are related to the 
+cell response to stress:
+
+* protein repair;
+* response to oxidative stress;
+* nucleotide-excision repair;
+* SOS response.
+
+An hypothesis could be that he removal of these genes may prevent the bacterium from
+inducing stress reponse and apoptosis in stress conditions, increasing fitness.
+
+There are also GO terms that may be of interest in the set of genes whose mutation
+has been misclassified as neutral and is instead disadvantageous. Those terms 
+indicate that this gene set is composed of some genes that are related to the
+basic functions needed for the cell life, like DNA and protein synthesis and
+metabolic processes:
+
+* DNA synthesis related terms:
+  - DNA replication
+  - ribonucleoside-triphosphate reductase activity
+* protein synthesis related terms:
+  - mature ribosome assembly
+  - protein folding
+  - peptide transport
+  - protein transport
+  - threonine synthase activity
+* metabolic process related terms:
+  - carbohydrate derivative biosynthetic process
+  - carbohydrate metabolic process
+  - thiamine diphosphate biosynthetic process
+
+A mutation of genes that have this kind of function may influence negatively
+the cell survival, since it may interfere with the cell metabolism.
+
+Of course, these observations are limited by the fact that they are purely
+qualitative. A GSEA or GO enrichment analysis would be more appropriate. An attempt
+was done to perform the two on http://www.webgestalt.org/ and http://geneontology.org/
+respectively, but without success due to the fact that S. pneumoniae TIGR4 data
+and annotations could not be found, possibly because newer annotations for S.
+pneumoniae are now used.
+
+
+# Conclusions
+A model using circular genomic coordinates in radians was successfully
+fitted on Tn-seq data in order to correct the bias in the fitness distribution.
+
+A fitness evenly distributed around 1 was obtained by applying the model and removing
+the fitness dependency on the genome coordinate. This allowed to find some genes
+which were misclassified with the original fitness.
+
+By looking at Gene Ontology terms associated with the genes wrongly classified as
+neutral, it was possible to verify that those genes actually may have a role in
+the cell success in survival and reproduction, explaining why their mutation may
+actually influence cell fitness.
+
+
