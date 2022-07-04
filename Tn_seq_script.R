@@ -9,6 +9,17 @@ library("GenomicRanges")
 library("cowplot")
 library("ggplot2")
 
+#install.packages("remotes")
+#remotes::install_github("davidsjoberg/ggsankey")
+library('ggsankey')
+
+# install.packages("dplyr")
+library("dplyr")
+
+# install.packages("scales")
+library("scales")
+
+
 
 ############## Data preprocessing ################
 # Import data
@@ -184,6 +195,8 @@ second_half_pred_all <- a - b*(second_half_df_all$coordinate - genome_length)
 second_half_df_all$corrected_fitness <- second_half_df_all$fitness - second_half_pred_all + 1
 
 all_df_linear <- rbind(first_half_df_all, second_half_df_all)
+# Remove possible duplicates (one gene overlapping both halves of the genome)
+all_df_linear <- all_df_linear[!duplicated(all_df_linear$coordinate),]
 all_df_linear$category_before <- fitness_gr$gene_category
 all_df_linear$category_after <- cut(all_df_linear$corrected_fitness, breaks=fitness_breakpoints, labels=fitness_categories)
 summary(all_df_linear$category_before)
@@ -261,7 +274,8 @@ correction_plots_windows(window_statistics_radians, x='coordinate')
 
 
 # Use the linear model on all the data
-all_df_radians <- data.frame(radians=fitness_gr$radians_coordinate,
+all_df_radians <- data.frame(gene_id=names(fitness_gr),
+                             radians=fitness_gr$radians_coordinate,
                              fitness=fitness_gr$avg_fitness,
                              category_before=factor(fitness_gr$gene_category))
 all_df_radians$corrected_fitness <- all_df_radians$fitness - predict(lm_radians, all_df_radians) + 1
@@ -272,64 +286,86 @@ summary(all_df_radians$category_after)
 # Plot before and after
 correction_plots(all_df_radians,x='radians')
 
+# Use sankey to show change of categories
+# TODO: match colors of other plots
+# https://r-charts.com/flow/sankey-diagram-ggplot2/
+df <- all_df_radians %>% ggsankey::make_long(category_before, category_after)
+ggplot(df, aes(x=x, next_x=next_x,
+               node=node, next_node=next_node,
+               fill=factor(node, levels=fitness_categories))) +
+  geom_sankey() +
+  theme_sankey(base_size=16)
+
 
 
 
 ############## Plots ################
 
-# Plots
-scatter.smooth(sinpi(df_linear_regression$radians), df_linear_regression$fitness)
+# PLOT SHOWING SMILE EFFECT WITH CIRCULAR COORDINATES #
 
-circular::plot.circular(rep(df_linear_regression$radians, df_linear_regression$fitness^100), bins=24, stack=TRUE)
-
-circular::rose.diag(rep(df_linear_regression$radians, df_linear_regression$fitness^100))
-
-ggplot(df_linear_regression, aes(x=radians, y=fitness)) +
-  geom_bar(stat="identity", fill=alpha("blue", 0.3)) +
-  ylim(-1,1.5) +
-  coord_polar(start = 0)
-
+# For this plot, it's better to use smaller windows. In that way it's possible
+# to see more in detail the genes category change.
+# In this case a window of 5000 is used.
 window_plot_df <- compute_window_statistics(fitness_gr, 5000)
 window_plot_df$gene_category <- cut(window_plot_df$fitness, breaks=fitness_breakpoints, labels=fitness_categories)
 window_plot_df$corrected_fitness <- window_plot_df$fitness - predict(lm_radians, window_plot_df) + 1
 window_plot_df$corrected_gene_category <- cut(window_plot_df$corrected_fitness, breaks=fitness_breakpoints, labels=fitness_categories)
 
 
-# PLOT SHOWING SMILE EFFECT WITH CIRCULAR COORDINATES #
-library(scales)
-pi_scales <- math_format(.x * pi, format = function(x) x / pi)
-
-
-# Plot before correction
-ggplot(window_plot_df) + 
-  geom_bar(aes(x=radians, y=fitness, fill=gene_category), stat="identity") + 
-  ylim(-0.5,1.3) +
-  theme(
-    axis.title = element_blank(),
-    axis.ticks.y = element_blank(),
-    axis.text.y = element_blank()
-  ) +
-  coord_polar(start=0) +
-  scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2))
+correction_plots_circular <- function(df, x) {
   
+  # Build scale with pi for plot axis
+  pi_scales <- math_format(.x*pi, format = function(x) x / pi)
+  
+  # Plot before correction
+  plot1 <- ggplot(window_plot_df) + 
+    geom_bar(aes(x=.data[[x]], y=fitness, fill=gene_category), stat="identity") + 
+    ylim(-0.5,1.3) +
+    theme(axis.title = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank()) +
+    coord_polar(start=0) +
+    scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2)) +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  
+  # Plot after correction
+  plot2 <- ggplot(window_plot_df) + 
+    geom_bar(aes(x=.data[[x]], y=corrected_fitness, fill=corrected_gene_category), stat="identity") + 
+    ylim(-0.5,1.3) +
+    theme(axis.title = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank()) +
+    coord_polar(start=0) +
+    scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2)) +
+    theme(plot.margin = unit(c(3,0,0,1), "lines"))
+  
+  # Show plots together
+  plot_grid(plot1, plot2, ncol=2, label_x=0,
+            labels=c('Before correction', 'After correction'))
+}
 
-# Plot after correction
-ggplot(window_plot_df) + 
-  geom_bar(aes(x=radians, y=corrected_fitness, fill=corrected_gene_category), stat="identity") + 
-  ylim(-0.5,1.3) +
-  theme(
-    axis.title = element_blank(),
-    axis.ticks.y = element_blank(),
-    axis.text.y = element_blank()
-  ) +
-  coord_polar(start=0) +
-  scale_x_continuous(labels=pi_scales, breaks=seq(0, 2*pi, pi/2))
+correction_plots_circular(window_plot_df, 'radians')
 
 
+# try APIs for info about genes changed from neutral category
+changed_from_neutral <- all_df_radians[all_df_radians$category_before=='Neutral' & all_df_radians$category_after!='Neutral',]
+gene_set <- changed_from_neutral[,1]
+gene_set
+write.table(data.frame(gene_set=gene_set),'test_gene_set.gmx', sep='\t',row.names=FALSE)
 
+library(httr)
+library(jsonlite)
+library(xml2)
 
+api_link <- "https://rest.uniprot.org/uniprotkb/search?query=%28taxonomy_id%3A170187%29%20"
+gene_name <- "SP_0004"
 
-# Old stuff
-smoothScatter(x=(geneCoord$V2[fData$average_fitness!=0]+geneCoord$V3[fData$average_fitness!=0])/2,
-              y=fData$average_fitness[fData$average_fitness!=0],
-              ylab = "avg gene fitness",xlab="genomic coordinates",main="fitness vs genome location")
+r <- GET(paste(api_link, gene_name, sep = ""))
+r <- GET("https://rest.uniprot.org/uniprotkb/search?query=%28taxonomy_id%3A170187%29%20SP_0004")
+stop_for_status(r)
+
+# use this if you get a simple nested list back, otherwise inspect its structure
+# head(data.frame(t(sapply(content(r),c))))
+head(fromJSON(toJSON(content(r))))
+
